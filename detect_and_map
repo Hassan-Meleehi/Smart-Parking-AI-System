@@ -1,0 +1,547 @@
+#!/usr/bin/env python
+"""
+detect_and_map.py
+Unified script:
+- Fetch frame from Raspberry Pi camera server
+- Run YOLOv8 segmentation/detection
+- Compute:
+    * Parking occupancy (per spot)
+    * Illegal parking:
+        - NoSpot  (car outside all spots)
+        - TwoSpots (car overlapping more than one spot)
+    * Collisions (any 2 cars touching each other except if both inside
+      different valid spots)
+- Push results to Firebase Realtime DB via REST
+- Optional AI visual view (window) to monitor what the AI is doing
+"""
+
+import os
+import time
+import json
+import base64
+from typing import List, Tuple, Dict, Optional
+
+import cv2
+import numpy as np
+import requests
+from ultralytics import YOLO
+
+# ----------------- CONFIG -----------------
+
+IMAGE_URL = os.environ.get(
+    "IMAGE_URL",
+    ""
+)
+
+FIREBASE_DB_URL = os.environ.get(
+    "FIREBASE_DB_URL",
+    ""
+).rstrip("/")
+
+SPOTS_PATH = os.environ.get(
+    "SPOTS_PATH",
+    "spots.json"
+)
+
+YOLO_MODEL = os.environ.get(
+    "YOLO_MODEL",
+    "yolov8n-seg.pt"
+)
+
+# IOU thresholds
+IOU_COLLISION = 0.01   # أي تلامس بسيط تقريباً = حادث
+IOU_SPOT_TOUCH = 0.18  # لازم تغطية أقوى للموقف عشان يعتبر داخل/يلمس الموقف
+
+VEHICLE_NAMES = {"car", "truck", "bus", "motorbike", "motorcycle"}
+
+# ===================== Duplicate-Event Prevention Memory =====================
+
+EVENT_TIMEOUT = 6.0  # ثواني لنفس السيارة/الحادث قبل إعادة البلاغ
+
+LAST_EVENTS = {
+    "violations": {},   # key: "car_<idx>_<type>" -> last_time (seconds)
+    "collisions": {},   # key: "i_j"              -> last_time (seconds)
+}
+
+
+# ----------------- BASIC HELPERS -----------------
+
+def fetch_image(url: str, timeout: int = 5):
+    """Download JPEG from camera server and decode with OpenCV."""
+    print(f"[i] fetching image: {url}")
+    for _ in range(3):
+        try:
+            r = requests.get(url, params={"t": time.time()}, timeout=timeout, stream=True)
+            r.raise_for_status()
+            data = np.frombuffer(r.content, np.uint8)
+            img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+            if img is not None and img.size > 0:
+                h, w = img.shape[:2]
+                print(f"[i] image size: {w}x{h}")
+                return img
+        except Exception as e:
+            print("[!] fetch error:", e)
+        time.sleep(1)
+    raise RuntimeError("Could not fetch image from camera")
+
+
+def load_spots(path: str) -> Dict[int, Tuple[int, int, int, int]]:
+    """
+    Load parking spots from JSON.
+
+    Format:
+        {
+          "spot_1": [x1, y1, x2, y2],
+          ...
+        }
+    """
+    if not os.path.exists(path):
+        print(f"[!] spots file not found: {path}")
+        return {}
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    spots: Dict[int, Tuple[int, int, int, int]] = {}
+    if isinstance(data, dict):
+        for key, coords in data.items():
+            if not isinstance(coords, list) or len(coords) != 4:
+                continue
+            try:
+                sid = int(str(key).replace("spot_", ""))
+            except ValueError:
+                continue
+            x1, y1, x2, y2 = map(int, coords)
+            spots[sid] = (x1, y1, x2, y2)
+
+    print(f"[i] spots loaded: {len(spots)}")
+    return spots
+
+
+def iou(box_a, box_b) -> float:
+    """Intersection-over-Union for two boxes (x1,y1,x2,y2)."""
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+
+    if area_a <= 0 or area_b <= 0:
+        return 0.0
+
+    return inter_area / float(area_a + area_b - inter_area + 1e-9)
+
+
+def encode_image_as_data_uri(img_bgr, path_tmp: str) -> str:
+    """
+    Save an image to disk, then return data:image/jpeg;base64,<...>
+    so dashboard can show it without Firebase Storage.
+    """
+    cv2.imwrite(path_tmp, img_bgr)
+    with open(path_tmp, "rb") as f:
+        b = f.read()
+    b64 = base64.b64encode(b).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+# ----------------- CORE ANALYSIS -----------------
+
+def run_yolo(model: YOLO, img) -> List[Tuple[float, float, float, float]]:
+    """Run YOLO and return list of vehicle bounding boxes (x1,y1,x2,y2)."""
+    res = model(img, verbose=False)[0]
+    boxes = []
+    names = res.names
+    for b in res.boxes:
+        cls_id = int(b.cls[0])
+        cls_name = names.get(cls_id, str(cls_id)).lower()
+        if cls_name in VEHICLE_NAMES:
+            x1, y1, x2, y2 = b.xyxy[0].tolist()
+            boxes.append((x1, y1, x2, y2))
+    print(f"[i] cars detected: {len(boxes)}")
+    return boxes
+
+
+def assign_cars_to_spots(
+    car_boxes: List[Tuple[float, float, float, float]],
+    spots: Dict[int, Tuple[int, int, int, int]],
+) -> Tuple[Dict[int, Optional[int]], Dict[int, List[int]]]:
+    """
+    car_to_spot[car_idx] = spot_id or None
+    spot_to_cars[spot_id] = list of car indices in that spot
+    """
+    car_to_spot: Dict[int, Optional[int]] = {}
+    spot_to_cars: Dict[int, List[int]] = {sid: [] for sid in spots.keys()}
+
+    for idx, box in enumerate(car_boxes):
+        best_iou = 0.0
+        best_sid = None
+        for sid, sbox in spots.items():
+            v = iou(box, sbox)
+            if v > best_iou:
+                best_iou = v
+                best_sid = sid
+
+        if best_sid is not None and best_iou > IOU_SPOT_TOUCH:
+            car_to_spot[idx] = best_sid
+            spot_to_cars[best_sid].append(idx)
+        else:
+            car_to_spot[idx] = None
+
+    return car_to_spot, spot_to_cars
+
+
+def classify_illegal_and_collisions(
+    car_boxes: List[Tuple[float, float, float, float]],
+    spots: Dict[int, Tuple[int, int, int, int]],
+    car_to_spot: Dict[int, Optional[int]],
+    spot_to_cars: Dict[int, List[int]],
+):
+    """
+    Illegal parking:
+      - NoSpot  : سيارة لا تلمس أي Spot (حتى بنسبة IOU_SPOT_TOUCH)
+      - TwoSpots: سيارة تغطي أكثر من Spot (IoU مع أكثر من Spot)
+
+    Collisions:
+      - أي سيارتين تتلامس (IoU > IOU_COLLISION)
+      - استثناء: لو كل سيارتين داخل مواقف مختلفة (كل وحده في Spot خاص بها)
+        → لا يعتبر حادث.
+    """
+    illegal_indices: List[int] = []
+    illegal_labels: Dict[int, str] = {}  # car_idx -> "NoSpot"/"TwoSpots"
+
+    # --- illegal detection (NoSpot / TwoSpots) ---
+    for idx, box in enumerate(car_boxes):
+        overlaps = []
+        for sid, sbox in spots.items():
+            v = iou(box, sbox)
+            if v > IOU_SPOT_TOUCH:
+                overlaps.append(sid)
+
+        if len(overlaps) == 0:
+            illegal_indices.append(idx)
+            illegal_labels[idx] = "NoSpot"
+        elif len(overlaps) >= 2:
+            illegal_indices.append(idx)
+            illegal_labels[idx] = "TwoSpots"
+
+    # --- collision detection ---
+    collision_pairs: List[Tuple[int, int]] = []
+    n = len(car_boxes)
+    for i in range(n):
+        for j in range(i + 1, n):
+            box_i = car_boxes[i]
+            box_j = car_boxes[j]
+            v = iou(box_i, box_j)
+            if v <= IOU_COLLISION:
+                continue  # ما في تلامس كافي
+
+            spot_i = car_to_spot[i]
+            spot_j = car_to_spot[j]
+
+            # استثناء: كل وحدة داخل Spot مختلف → مو حادث
+            if spot_i is not None and spot_j is not None and spot_i != spot_j:
+                continue
+
+            collision_pairs.append((i, j))
+
+    return illegal_indices, illegal_labels, collision_pairs
+
+
+def build_parking_status(
+    spots: Dict[int, Tuple[int, int, int, int]],
+    car_to_spot: Dict[int, Optional[int]],
+) -> List[Dict[str, object]]:
+    """Return list like [{spot_id, status}, ...]."""
+    occupied_spots = set(
+        sid for sid in car_to_spot.values() if sid is not None
+    )
+    result = []
+    for sid in sorted(spots.keys()):
+        status = "Occupied" if sid in occupied_spots else "Available"
+        result.append({"spot_id": sid, "status": status})
+    return result
+
+
+# ----------------- FIREBASE SENDERS -----------------
+
+def send_json(path: str, body: dict, method: str = "POST") -> Optional[dict]:
+    if not FIREBASE_DB_URL:
+        print("[!] FIREBASE_DB_URL not set, skipping send")
+        return None
+
+    url = f"{FIREBASE_DB_URL}/{path.lstrip('/')}.json"
+    try:
+        if method.upper() == "PUT":
+            r = requests.put(url, json=body, timeout=10)
+        else:
+            r = requests.post(url, json=body, timeout=10)
+        r.raise_for_status()
+        try:
+            return r.json()
+        except Exception:
+            return None
+    except Exception as e:
+        print(f"[!] send_json error for {path}: {e}")
+        return None
+
+
+def send_status(ts_ms: int, parking_status: List[dict], summary: str):
+    payload = {
+        "timestamp": ts_ms,
+        "parking_status": parking_status,
+        "summary": summary,
+    }
+    key = str(ts_ms)
+    back = send_json(f"results/{key}", payload, method="PUT")
+    if back is not None:
+        print(f">> status sent to /results/{key} spots={len(parking_status)}")
+
+
+def send_violation(ts_ms: int, spot_id: int, violation_type: str, img_bgr):
+    data_uri = encode_image_as_data_uri(
+        img_bgr, os.path.expanduser("~/parking-ai/violation_view.jpg")
+    )
+    payload = {
+        "timestamp": ts_ms,
+        "spot_id": spot_id,
+        "type": violation_type,
+        "imageUrl": data_uri,
+        "summary": f"Violation: {violation_type} at spot {spot_id}",
+    }
+    send_json("violations", payload, method="POST")
+    print(f">> violation sent for spot {spot_id} ({violation_type})")
+
+
+def send_collision(ts_ms: int, img_bgr):
+    data_uri = encode_image_as_data_uri(
+        img_bgr, os.path.expanduser("~/parking-ai/collision_view.jpg")
+    )
+    payload = {
+        "timestamp": ts_ms,
+        "collision": True,
+        "imageUrl": data_uri,
+        "summary": "collision detected",
+    }
+    send_json("collisions", payload, method="POST")
+    print(">> collision sent")
+
+
+# ----------------- VISUALIZATION (AI VIEW) -----------------
+
+def draw_ai_view(
+    frame,
+    spots: Dict[int, Tuple[int, int, int, int]],
+    parking_status: List[dict],
+    car_boxes: List[Tuple[float, float, float, float]],
+    illegal_labels: Dict[int, str],
+    collision_pairs: List[Tuple[int, int]],
+):
+    """
+    يرسم:
+      - المواقف (أخضر/أحمر)
+      - السيارات
+      - السيارات المخالفة مع كتابة:
+          * NoSpot
+          * TwoSpots
+      - السيارات المتصادمة مكتوب عليها Collision
+      - شريط معلومات تحت باللون الأزرق
+    """
+    canvas = frame.copy()
+
+    # map spot_id -> status
+    status_map = {int(s["spot_id"]): s["status"] for s in parking_status}
+
+    # draw spots
+    for sid, (x1, y1, x2, y2) in spots.items():
+        st = status_map.get(sid, "Unknown").lower()
+        if st == "occupied":
+            color = (0, 0, 255)   # red
+        elif st == "available":
+            color = (0, 255, 0)   # green
+        else:
+            color = (128, 128, 128)
+
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(canvas, str(sid), (x1 + 3, y1 + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+
+    # set of car indices that are in collisions
+    collision_indices = set()
+    for i, j in collision_pairs:
+        collision_indices.add(i)
+        collision_indices.add(j)
+
+    # draw cars + labels
+    for idx, (x1, y1, x2, y2) in enumerate(car_boxes):
+        x1i, y1i, x2i, y2i = map(int, (x1, y1, x2, y2))
+
+        col = (0, 255, 0)  # سيارة عادية
+        label_parts = []
+
+        # مخالفة؟
+        if idx in illegal_labels:
+            col = (0, 255, 255)  # أصفر
+            label_parts.append(illegal_labels[idx])
+
+        # حادث؟
+        if idx in collision_indices:
+            col = (0, 0, 255)  # أحمر
+            label_parts.append("Collision")
+
+        cv2.rectangle(canvas, (x1i, y1i), (x2i, y2i), col, 2)
+
+        if label_parts:
+            label_text = " ".join(label_parts)
+            cv2.putText(
+                canvas,
+                label_text,
+                (x1i, max(0, y1i - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+    # draw collision lines بين السيارات المتصادمة
+    for i, j in collision_pairs:
+        bx1, by1, bx2, by2 = car_boxes[i]
+        cx1, cy1, cx2, cy2 = car_boxes[j]
+        ci = (int((bx1 + bx2) / 2), int((by1 + by2) / 2))
+        cj = (int((cx1 + cx2) / 2), int((cy1 + cy2) / 2))
+        cv2.line(canvas, ci, cj, (0, 0, 255), 3)
+
+    # info bar at bottom (blue text)
+    h, w = canvas.shape[:2]
+    bar_y = h - 30
+    cv2.rectangle(canvas, (0, bar_y - 20), (w, h), (0, 0, 0), -1)
+
+    occupied = sum(1 for s in parking_status if s["status"] == "Occupied")
+    text = (
+        f"Occupied: {occupied}/{len(parking_status)}  |  "
+        f"Illegal cars: {len(illegal_labels)}  |  "
+        f"Collisions: {len(collision_pairs)}  |  Press 'q' to quit"
+    )
+
+    cv2.putText(canvas, text, (10, h - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv2.LINE_AA)
+
+    return canvas
+
+
+# ----------------- MAIN LOOP -----------------
+
+def main(visual: bool = False):
+    spots = load_spots(SPOTS_PATH)
+    if not spots:
+        print("[FATAL] No parking spots loaded; cannot start.")
+        return
+
+    print(f"[i] loading YOLO model: {YOLO_MODEL}")
+    model = YOLO(YOLO_MODEL)
+
+    print("[i] Initialization complete. Starting detection loop...")
+    while True:
+        loop_start = time.time()
+
+        try:
+            frame = fetch_image(IMAGE_URL)
+        except Exception as e:
+            print("[CRITICAL] cannot fetch frame:", e)
+            time.sleep(2.0)
+            continue
+
+        # YOLO detection
+        car_boxes = run_yolo(model, frame)
+
+        # mapping cars ↔ spots
+        car_to_spot, spot_to_cars = assign_cars_to_spots(car_boxes, spots)
+
+        # illegal + collisions
+        illegal_indices, illegal_labels, collision_pairs = classify_illegal_and_collisions(
+            car_boxes, spots, car_to_spot, spot_to_cars
+        )
+
+        # build parking_status
+        parking_status = build_parking_status(spots, car_to_spot)
+
+        # summary + send to Firebase
+        ts_ms = int(time.time() * 1000)
+        summary = (
+            f"spots={len(spots)} cars={len(car_boxes)} "
+            f"illegal={len(illegal_indices)} collisions={len(collision_pairs)}"
+        )
+        send_status(ts_ms, parking_status, summary)
+
+        now = time.time()
+
+        # --- إرسال المخالفات مع منع التكرار لنفس السيارة/النوع ---
+        if illegal_indices:
+            annotated = draw_ai_view(
+                frame, spots, parking_status, car_boxes, illegal_labels, collision_pairs
+            )
+
+            for idx in illegal_indices:
+                vtype = illegal_labels.get(idx, "Unknown")
+                key = f"car_{idx}_{vtype}"
+                last_time = LAST_EVENTS["violations"].get(key, 0.0)
+
+                if now - last_time < EVENT_TIMEOUT:
+                    continue  # نفس المخالفة لنفس السيارة لسه قريبة زمنياً
+
+                LAST_EVENTS["violations"][key] = now
+                sid0 = car_to_spot.get(idx) or -1
+                send_violation(ts_ms, sid0, vtype, annotated)
+
+        # --- إرسال الحوادث مع منع التكرار لنفس الزوج من السيارات ---
+        if collision_pairs:
+            annotated = draw_ai_view(
+                frame, spots, parking_status, car_boxes, illegal_labels, collision_pairs
+            )
+
+            for (i, j) in collision_pairs:
+                a, b = sorted((i, j))
+                key = f"{a}_{b}"
+                last_time = LAST_EVENTS["collisions"].get(key, 0.0)
+
+                if now - last_time < EVENT_TIMEOUT:
+                    continue  # نفس الحادث بين نفس الزوج
+
+                LAST_EVENTS["collisions"][key] = now
+                send_collision(ts_ms, annotated)
+
+        # visual mode
+        if visual:
+            annotated = draw_ai_view(
+                frame, spots, parking_status, car_boxes, illegal_labels, collision_pairs
+            )
+            cv2.imshow("Smart Parking AI View", annotated)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+        # sleep for fixed interval (0.2 ثانية تقريباً)
+        elapsed = time.time() - loop_start
+        wait = max(0.0, 0.2 - elapsed)
+        print(f"[i] cycle took {elapsed:.2f}s, sleeping {wait:.2f}s")
+        time.sleep(wait)
+
+    if visual:
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--visual", action="store_true", help="Show AI parking view window")
+    args = parser.parse_args()
+
+    main(visual=args.visual)
